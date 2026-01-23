@@ -27,7 +27,7 @@ build: clean ## Build package
 	uv build
 
 publish: build ## Publish to PyPI
-	uv run twine upload dist/*
+	uvx twine upload dist/*
 
 # ============================================================================
 # Pre-commit
