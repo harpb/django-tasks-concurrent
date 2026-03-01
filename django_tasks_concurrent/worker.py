@@ -8,15 +8,15 @@ While one task awaits I/O, others can execute.
 import asyncio
 import logging
 import signal
-from inspect import iscoroutinefunction
 
 from asgiref.sync import sync_to_async
 from django.db import close_old_connections
 from django.db.utils import OperationalError
-from django_tasks.backends.database.models import DBTaskResult
-from django_tasks.backends.database.utils import exclusive_transaction
+from django_tasks.base import TaskContext
 from django_tasks.signals import task_finished, task_started
 from django_tasks.utils import get_random_id
+from django_tasks_db.models import DBTaskResult
+from django_tasks_db.utils import exclusive_transaction
 
 logger = logging.getLogger("django_tasks_concurrent")
 
@@ -138,28 +138,29 @@ class ConcurrentWorker:
     async def _run_task(self, db_task_result: DBTaskResult, sub_id: str) -> None:
         """
         Execute a task - async tasks run natively, sync via thread pool.
+        Uses task.acall() which handles both sync and async functions.
         """
         task = db_task_result.task
         task_result = db_task_result.task_result
-        args = task_result.args
-        kwargs = task_result.kwargs
 
         logger.info(f"Sub-worker {sub_id} running {task.name} (id={db_task_result.id})")
 
         # Send task_started signal
-        backend_type = type(task.get_backend())
+        backend_type = task.get_backend()
         await sync_to_async(task_started.send)(sender=backend_type, task_result=task_result)
 
         try:
-            if iscoroutinefunction(task.func):
-                # Native async execution - yields on await
-                result = await task.func(*args, **kwargs)
+            if task.takes_context:
+                result = await task.acall(
+                    TaskContext(task_result=task_result),
+                    *task_result.args,
+                    **task_result.kwargs,
+                )
             else:
-                # Sync task - run in thread pool to not block
-                result = await sync_to_async(task.func)(*args, **kwargs)
+                result = await task.acall(*task_result.args, **task_result.kwargs)
 
-            # Mark succeeded
-            await sync_to_async(db_task_result.set_succeeded)(result, task_result.metadata)
+            # Mark successful
+            await sync_to_async(db_task_result.set_successful)(result)
             logger.info(f"Sub-worker {sub_id} completed task {db_task_result.id}")
 
             # Send task_finished signal
@@ -167,10 +168,11 @@ class ConcurrentWorker:
 
         except Exception as e:
             logger.exception(f"Sub-worker {sub_id} task {db_task_result.id} failed: {e}")
-            await sync_to_async(db_task_result.set_failed)(e, task_result.metadata)
+            await sync_to_async(db_task_result.set_failed)(e)
 
             # Send task_finished signal even on failure
             try:
-                await sync_to_async(task_finished.send)(sender=backend_type, task_result=db_task_result.task_result)
+                sender = type(db_task_result.task.get_backend())
+                await sync_to_async(task_finished.send)(sender=sender, task_result=db_task_result.task_result)
             except Exception:
                 logger.exception("Failed to send task_finished signal")

@@ -98,19 +98,16 @@ class TestConcurrentWorkerRunTask:
 
     @pytest.mark.asyncio
     async def test_run_async_task(self, worker_config):
-        """Async tasks are executed natively."""
+        """Async tasks are executed via task.acall()."""
         worker = ConcurrentWorker(**worker_config)
-
-        async def async_task_func(x):
-            return x * 2
 
         mock_db_task = MagicMock()
         mock_db_task.id = 1
         mock_db_task.task.name = "test_task"
-        mock_db_task.task.func = async_task_func
+        mock_db_task.task.takes_context = False
+        mock_db_task.task.acall = AsyncMock(return_value=10)
         mock_db_task.task_result.args = (5,)
         mock_db_task.task_result.kwargs = {}
-        mock_db_task.task_result.metadata = {}
 
         mock_backend = MagicMock()
         mock_db_task.task.get_backend.return_value = mock_backend
@@ -118,29 +115,26 @@ class TestConcurrentWorkerRunTask:
         with patch("django_tasks_concurrent.worker.task_started"):
             with patch("django_tasks_concurrent.worker.task_finished"):
                 with patch("django_tasks_concurrent.worker.sync_to_async") as mock_sync:
-                    # Mock sync_to_async to return async callables
                     mock_sync.side_effect = lambda f: AsyncMock(side_effect=f)
 
                     await worker._run_task(mock_db_task, "test-worker-0")
 
-        mock_db_task.set_succeeded.assert_called_once()
-        assert mock_db_task.set_succeeded.call_args[0][0] == 10  # 5 * 2
+        mock_db_task.task.acall.assert_called_once_with(5)
+        mock_db_task.set_successful.assert_called_once()
+        assert mock_db_task.set_successful.call_args[0][0] == 10
 
     @pytest.mark.asyncio
     async def test_run_sync_task(self, worker_config):
-        """Sync tasks are executed via thread pool."""
+        """Sync tasks are executed via task.acall()."""
         worker = ConcurrentWorker(**worker_config)
-
-        def sync_task_func(x):
-            return x + 10
 
         mock_db_task = MagicMock()
         mock_db_task.id = 2
         mock_db_task.task.name = "sync_test_task"
-        mock_db_task.task.func = sync_task_func
+        mock_db_task.task.takes_context = False
+        mock_db_task.task.acall = AsyncMock(return_value=15)
         mock_db_task.task_result.args = (5,)
         mock_db_task.task_result.kwargs = {}
-        mock_db_task.task_result.metadata = {}
 
         mock_backend = MagicMock()
         mock_db_task.task.get_backend.return_value = mock_backend
@@ -148,34 +142,24 @@ class TestConcurrentWorkerRunTask:
         with patch("django_tasks_concurrent.worker.task_started"):
             with patch("django_tasks_concurrent.worker.task_finished"):
                 with patch("django_tasks_concurrent.worker.sync_to_async") as mock_sync:
-                    # Return async mock that calls the original function
-                    def make_async(func):
-                        async def wrapper(*args, **kwargs):
-                            return func(*args, **kwargs)
-
-                        return wrapper
-
-                    mock_sync.side_effect = make_async
+                    mock_sync.side_effect = lambda f: AsyncMock(side_effect=f)
 
                     await worker._run_task(mock_db_task, "test-worker-0")
 
-        mock_db_task.set_succeeded.assert_called_once()
+        mock_db_task.set_successful.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_run_task_handles_exception(self, worker_config):
         """Task exceptions are caught and task is marked failed."""
         worker = ConcurrentWorker(**worker_config)
 
-        async def failing_task():
-            raise ValueError("Task failed!")
-
         mock_db_task = MagicMock()
         mock_db_task.id = 3
         mock_db_task.task.name = "failing_task"
-        mock_db_task.task.func = failing_task
+        mock_db_task.task.takes_context = False
+        mock_db_task.task.acall = AsyncMock(side_effect=ValueError("Task failed!"))
         mock_db_task.task_result.args = ()
         mock_db_task.task_result.kwargs = {}
-        mock_db_task.task_result.metadata = {}
 
         mock_backend = MagicMock()
         mock_db_task.task.get_backend.return_value = mock_backend
@@ -298,22 +282,22 @@ class TestConcurrentExecution:
 
         # Create actual async functions (not lambdas returning coroutines)
         # because iscoroutinefunction checks the function, not return value
-        async def make_slow_func(task_id: int):
-            async def slow_func() -> int:
+        async def make_slow_acall(task_id: int):
+            async def slow_acall(*args, **kwargs) -> int:
                 await asyncio.sleep(task_delay)
                 completed_tasks.append(task_id)
                 return task_id
 
-            return slow_func
+            return slow_acall
 
         async def make_mock_db_task(task_id: int) -> MagicMock:
             mock = MagicMock()
             mock.id = task_id
             mock.task.name = f"task_{task_id}"
-            mock.task.func = await make_slow_func(task_id)
+            mock.task.takes_context = False
+            mock.task.acall = await make_slow_acall(task_id)
             mock.task_result.args = ()
             mock.task_result.kwargs = {}
-            mock.task_result.metadata = {}
             mock.task.get_backend.return_value = MagicMock()
             return mock
 

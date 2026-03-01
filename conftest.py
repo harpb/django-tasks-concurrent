@@ -17,7 +17,7 @@ def pytest_configure():
                 "django.contrib.contenttypes",
                 "django.contrib.auth",
                 "django_tasks",
-                "django_tasks.backends.database",
+                "django_tasks_db",
                 "django_tasks_concurrent",
             ],
             DATABASES={
@@ -28,7 +28,7 @@ def pytest_configure():
             },
             TASKS={
                 "default": {
-                    "BACKEND": "django_tasks.backends.database.DatabaseBackend",
+                    "BACKEND": "django_tasks_db.DatabaseBackend",
                     "QUEUES": ["default"],
                 }
             },
