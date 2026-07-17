@@ -100,12 +100,18 @@ class ConcurrentWorker:
                     # No tasks available - wait before polling again
                     await asyncio.sleep(self.interval)
 
-                # Clean up stale DB connections
-                await sync_to_async(close_old_connections)()
-
             except Exception as e:
                 logger.exception(f"Sub-worker {sub_id} error: {e}")
                 await asyncio.sleep(self.interval)
+            finally:
+                # Reset stale/broken DB connections on EVERY iteration, including the
+                # error path. If a poll failed because the database dropped the
+                # connection (server restart, network blip), close_old_connections()
+                # discards the dead connection so the next poll opens a fresh one.
+                # Placed in `finally` deliberately: if this only ran on success, a
+                # dropped connection would be reused every iteration and the sub-worker
+                # would keep erroring without ever recovering.
+                await sync_to_async(close_old_connections)()
 
         logger.debug(f"Sub-worker {sub_id} stopped")
 

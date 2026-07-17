@@ -7,6 +7,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from django.db.utils import OperationalError
 
 from django_tasks_concurrent.worker import ConcurrentWorker
 
@@ -321,3 +322,55 @@ class TestConcurrentExecution:
         # Should take ~0.3s, not ~0.9s (3 * 0.3s sequential)
         # Allow some tolerance for test overhead
         assert elapsed < task_delay * 2, f"Expected ~{task_delay}s, got {elapsed:.2f}s (tasks ran sequentially?)"
+
+
+class TestConcurrentWorkerDisconnectRecovery:
+    """Sub-worker survives a dropped DB connection and reconnects."""
+
+    @pytest.mark.asyncio
+    async def test_sub_worker_reconnects_after_db_disconnect(self, worker_config):
+        """
+        A poll that fails because the database dropped the connection must still
+        reset the connection (close_old_connections) so the NEXT poll reconnects.
+
+        Regression guard: close_old_connections lives in a `finally`, not only on
+        the success path. If it regressed back to running only on success, the
+        broken connection would be reused and iteration 2 would never happen.
+        """
+        worker = ConcurrentWorker(**worker_config)
+        claim_calls = 0
+        reconnects = 0
+
+        async def flaky_claim(sub_id):
+            nonlocal claim_calls
+            claim_calls += 1
+            if claim_calls == 1:
+                # The exact failure Postgres raises when it closes the connection.
+                raise OperationalError("server closed the connection unexpectedly")
+            # After the reconnect we've proven recovery — stop the loop.
+            worker.running = False
+            return None
+
+        def count_reconnect():
+            nonlocal reconnects
+            reconnects += 1
+
+        with patch.object(worker, "_claim_task", side_effect=flaky_claim):
+            with patch(
+                "django_tasks_concurrent.worker.close_old_connections",
+                side_effect=count_reconnect,
+            ):
+                with patch(
+                    "django_tasks_concurrent.worker.sync_to_async",
+                    side_effect=lambda f: AsyncMock(side_effect=f),
+                ):
+                    with patch(
+                        "django_tasks_concurrent.worker.asyncio.sleep",
+                        new_callable=AsyncMock,
+                    ):
+                        await worker._sub_worker(0)
+
+        # It kept polling past the disconnect (didn't die on iteration 1)...
+        assert claim_calls == 2
+        # ...and reset the connection on BOTH iterations, including the errored one.
+        assert reconnects == 2
