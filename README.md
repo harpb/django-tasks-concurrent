@@ -38,14 +38,24 @@ python manage.py concurrent_worker --concurrency=5 --interval=0.5
 python manage.py concurrent_worker --queue-name=high-priority --backend=default
 ```
 
+Or from code — same options either way, since the command is a shell over `run_worker`:
+
+```bash
+from django_tasks_concurrent import run_worker, run_worker_async
+
+run_worker(concurrency=5)               # creates the event loop and runs until shut down
+await run_worker_async(concurrency=5)   # when you already have a loop
+```
+
 ### Options
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--concurrency` | 3 | Number of concurrent sub-workers |
-| `--interval` | 1.0 | Polling interval (seconds) when no tasks |
-| `--queue-name` | `settings.TASK_QUEUE_NAME` or "default" | Queue to process |
-| `--backend` | "default" | Django Tasks backend name |
+| Option | CLI flag | Default | Description |
+|--------|----------|---------|-------------|
+| `concurrency` | `--concurrency` | 3 | Number of concurrent sub-workers |
+| `interval` | `--interval` | 1.0 | Polling interval (seconds) when no tasks |
+| `queue_name` | `--queue-name` | `settings.TASK_QUEUE_NAME` or "default" | Queue to process |
+| `backend_name` | `--backend` | "default" | Django Tasks backend name |
+| `scheduler_interval` | `--scheduler-interval` | 15.0 | Ceiling on one `@periodic` scheduler sleep |
 
 ## Periodic tasks
 
@@ -64,7 +74,19 @@ def cleanup_foobar(timestamp: int):
 
 `@periodic` goes **above** `@task` and hands the task straight back, so `cleanup_foobar.enqueue()` still works and the decorated name is still the ordinary task object.
 
-**Starting the scheduler is one call, made once at worker startup:**
+**Running a worker is all it takes.** `concurrent_worker` schedules as well as executes — no flag, no beat process to deploy and forget:
+
+```bash
+python manage.py concurrent_worker
+```
+
+Scheduling isn't optional because there's nothing to opt out of: the scheduler only *enqueues*, so it costs one indexed query per wake-up, and with no `@periodic` tasks declared it does nothing at all. Being off the execution path, it can't drift behind a long-running job.
+
+It runs as a **side task** beside the sub-workers, which means it shares their fate in both directions. Shutting the worker down cancels it. And if the scheduler itself dies, the worker stops rather than carrying on — a worker that has quietly stopped scheduling looks perfectly healthy from the outside while every `@periodic` task silently stops firing.
+
+### Hosting the scheduler in a worker this package doesn't own
+
+`db_worker` is upstream code with no hook to run anything alongside its loop, so there it takes one call at startup:
 
 ```bash
 from django_tasks_concurrent.scheduler import run_scheduler_thread
@@ -72,9 +94,7 @@ from django_tasks_concurrent.scheduler import run_scheduler_thread
 run_scheduler_thread()   # daemon thread, returns a stop event
 ```
 
-That is the only entry point, and deliberately so. A sweep is a single indexed query, and the scheduler is useless without a worker to drain what it queues — so it belongs *inside* whichever worker you already run rather than as a process of its own. It works the same in `concurrent_worker`, Django's own `db_worker`, or a wrapper around either; there is no beat process to deploy and forget, and no flag to remember.
-
-The scheduler only *enqueues* — it never runs task code — so it costs one indexed query per wake-up and, being off the execution path, can't drift behind a long-running job. Being a daemon thread, it never holds up shutdown, and it swallows its own errors so a scheduling problem can't take down the worker hosting it.
+This is the one place the failure trade goes the other way: as a guest in someone else's worker it swallows its errors rather than taking that worker down with it.
 
 To check what's registered, or to sweep once from a shell or an external timer:
 

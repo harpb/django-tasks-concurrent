@@ -12,6 +12,11 @@ Two pieces, usable together or apart:
 Usage:
     python manage.py concurrent_worker --concurrency=3
 
+    from django_tasks_concurrent import run_worker, run_worker_async
+
+    run_worker(concurrency=3)          # creates the event loop for you
+    await run_worker_async(concurrency=3)
+
     from django_tasks import task
     from django_tasks_concurrent import periodic
 
@@ -20,21 +25,20 @@ Usage:
     def cleanup_foobar(timestamp: int):
         ...
 
-    # once at worker startup, in whichever worker you run
-    from django_tasks_concurrent.scheduler import run_scheduler_thread
-
-    run_scheduler_thread()
+Running a worker is all it takes — it schedules as well as executes. Only a worker this package does
+NOT own (Django's own ``db_worker``) needs the schedule started by hand, with
+``scheduler.run_scheduler_thread()``.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 def __getattr__(name: str):
     """Lazy import to avoid loading Django models at import time."""
-    if name == "ConcurrentWorker":
-        from django_tasks_concurrent.worker import ConcurrentWorker  # noqa: PLC0415
+    if name in {"ConcurrentWorker", "WorkerOptions", "run_worker", "run_worker_async"}:
+        from django_tasks_concurrent import worker  # noqa: PLC0415
 
-        return ConcurrentWorker
+        return getattr(worker, name)
     if name in {"periodic", "PeriodicTask", "registered_periodic_tasks"}:
         # The module is periodic_tasks, NOT periodic: a submodule named `periodic` would be set as an
         # attribute of this package on first import and shadow the decorator, so
@@ -48,7 +52,10 @@ def __getattr__(name: str):
 __all__ = [
     "ConcurrentWorker",
     "PeriodicTask",
+    "WorkerOptions",
     "__version__",
     "periodic",
     "registered_periodic_tasks",
+    "run_worker",
+    "run_worker_async",
 ]

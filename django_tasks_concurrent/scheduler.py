@@ -15,10 +15,12 @@ hundreds. Only the most recent slot is ever considered, which is what makes repe
 one slot idempotent.
 """
 
+import asyncio
 import logging
 import threading
 from datetime import timedelta
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import IntegrityError, close_old_connections, transaction
 from django.utils import timezone
@@ -117,20 +119,49 @@ def prune_periodic_defers(now) -> int:
     return deleted
 
 
+async def defer_periodic_forever(interval: float = 15.0) -> None:
+    """Sweep the schedules forever. The scheduler as a coroutine, for an async worker's task group.
+
+    ``ConcurrentWorker`` runs this as a side task, so it is never started by hand — see
+    ``run_worker``. It is cancelled at shutdown rather than asked to stop, which is why there is no
+    stop flag: cancellation is how an asyncio task group ends anything, and an exception raised here
+    propagates out of the group and takes the worker down with it. That is deliberate. A worker whose
+    scheduler died is a worker that silently runs nothing on schedule, which is worse than one that
+    exits loudly.
+
+    Per-poll errors are still swallowed and logged — a single bad sweep (a lost connection, one
+    broken schedule) is a hiccup, not a reason to stop.
+
+    ``interval`` is the ceiling on one sleep, not a poll period — see ``seconds_until_next_slot``.
+    """
+    logger.info(f"Starting scheduler interval={interval} schedules={len(registered_periodic_tasks())}")
+    while True:
+        try:
+            fired = await sync_to_async(defer_periodic_tasks)()
+            if fired:
+                logger.debug(f"Scheduler deferred {fired} periodic task(s)")
+        except Exception as scheduler_error:
+            logger.exception(f"Scheduler poll failed: {scheduler_error}")
+        finally:
+            # Same reasoning as the worker's sub-loop: a connection the database dropped has to be
+            # discarded on the error path too, or every later poll reuses the dead one.
+            await sync_to_async(close_old_connections)()
+        await asyncio.sleep(seconds_until_next_slot(max_sleep=interval))
+
+
 def run_scheduler_thread(interval: float = 15.0) -> threading.Event:
     """Run the scheduler on a daemon thread and return its stop event.
 
-    This is the only way to start the scheduler, and it is deliberately one function rather than a
-    process of its own: a sweep is a single indexed query, and the scheduler is useless without a
-    worker to drain what it queues, so it belongs beside whichever worker you already run — ours,
-    Django's ``db_worker``, or a wrapper around either. Call it once at worker startup.
+    For hosting the scheduler inside a worker this package does not own — Django's ``db_worker``, or
+    a wrapper around it — where there is no task group to add a coroutine to. If you run
+    ``ConcurrentWorker`` you do not need this: it schedules on its own.
 
-    The loop is plain synchronous, not a coroutine: there is nothing here to await, and ``asyncio``
-    signal handlers can only be installed from the main thread anyway. ``interval`` is the ceiling on
-    one sleep, not a poll period — see ``seconds_until_next_slot``.
+    The loop is plain synchronous rather than ``defer_periodic_forever``: a sweep is one indexed
+    query, and ``asyncio`` signal handlers can only be installed from the main thread anyway.
 
     Daemon, so it never keeps the process alive at shutdown. Swallows everything — a scheduler
-    problem must not take down the worker it rides in.
+    problem must not take down a worker that knows nothing about it. This is the one place that
+    trade goes the other way from ``defer_periodic_forever``, because here we are a guest.
     """
     stop_event = threading.Event()
 

@@ -1,103 +1,81 @@
 """
 Tests for the concurrent_worker management command.
+
+The command is a shell over ``run_worker`` — it parses flags and hands them over — so these lock the
+translation from argv to options, not the worker's behaviour.
 """
 
 from io import StringIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
+import pytest
 from django.core.management import call_command
+
+COMMAND_RUN_WORKER = "django_tasks_concurrent.management.commands.concurrent_worker.run_worker"
+
+
+@pytest.fixture
+def run_worker():
+    with patch(COMMAND_RUN_WORKER) as mock_run_worker:
+        yield mock_run_worker
 
 
 class TestConcurrentWorkerCommand:
     """Tests for concurrent_worker management command."""
 
-    def test_command_default_arguments(self):
+    def test_command_default_arguments(self, run_worker):
         """Command uses default arguments when none provided."""
-        with patch("django_tasks_concurrent.management.commands.concurrent_worker.ConcurrentWorker") as mock_worker:
-            with patch("django_tasks_concurrent.management.commands.concurrent_worker.asyncio.run"):
-                mock_instance = MagicMock()
-                mock_worker.return_value = mock_instance
+        call_command("concurrent_worker", stdout=StringIO())
 
-                out = StringIO()
-                call_command("concurrent_worker", stdout=out)
+        options = run_worker.call_args.kwargs
+        assert options["concurrency"] == 3
+        assert options["interval"] == 1.0
+        assert options["queue_name"] == "default"
+        assert options["backend_name"] == "default"
+        # Scheduling is not a flag — a worker schedules, full stop. Only its sleep ceiling is tunable.
+        assert options["scheduler_interval"] == 15.0
 
-                # This command runs workers and nothing else — scheduling is started by the host
-                # process with run_scheduler_thread, so there is no scheduler kwarg to pass here.
-                call_kwargs = mock_worker.call_args.kwargs
-                assert call_kwargs["concurrency"] == 3
-                assert call_kwargs["interval"] == 1.0
-                assert call_kwargs["queue_name"] == "default"
-                assert call_kwargs["backend_name"] == "default"
-                assert "scheduler" not in call_kwargs
-
-    def test_command_custom_concurrency(self):
+    def test_command_custom_concurrency(self, run_worker):
         """Command accepts custom concurrency."""
-        with patch("django_tasks_concurrent.management.commands.concurrent_worker.ConcurrentWorker") as mock_worker:
-            with patch("django_tasks_concurrent.management.commands.concurrent_worker.asyncio.run"):
-                mock_instance = MagicMock()
-                mock_worker.return_value = mock_instance
+        call_command("concurrent_worker", concurrency=5, stdout=StringIO())
 
-                out = StringIO()
-                call_command("concurrent_worker", concurrency=5, stdout=out)
+        assert run_worker.call_args.kwargs["concurrency"] == 5
 
-                assert mock_worker.call_args[1]["concurrency"] == 5
-
-    def test_command_custom_interval(self):
+    def test_command_custom_interval(self, run_worker):
         """Command accepts custom polling interval."""
-        with patch("django_tasks_concurrent.management.commands.concurrent_worker.ConcurrentWorker") as mock_worker:
-            with patch("django_tasks_concurrent.management.commands.concurrent_worker.asyncio.run"):
-                mock_instance = MagicMock()
-                mock_worker.return_value = mock_instance
+        call_command("concurrent_worker", interval=0.5, stdout=StringIO())
 
-                out = StringIO()
-                call_command("concurrent_worker", interval=0.5, stdout=out)
+        assert run_worker.call_args.kwargs["interval"] == 0.5
 
-                assert mock_worker.call_args[1]["interval"] == 0.5
-
-    def test_command_custom_queue_name(self):
+    def test_command_custom_queue_name(self, run_worker):
         """Command accepts custom queue name."""
-        with patch("django_tasks_concurrent.management.commands.concurrent_worker.ConcurrentWorker") as mock_worker:
-            with patch("django_tasks_concurrent.management.commands.concurrent_worker.asyncio.run"):
-                mock_instance = MagicMock()
-                mock_worker.return_value = mock_instance
+        call_command("concurrent_worker", queue_name="high-priority", stdout=StringIO())
 
-                out = StringIO()
-                call_command("concurrent_worker", queue_name="high-priority", stdout=out)
+        assert run_worker.call_args.kwargs["queue_name"] == "high-priority"
 
-                assert mock_worker.call_args[1]["queue_name"] == "high-priority"
-
-    def test_command_custom_backend(self):
+    def test_command_custom_backend(self, run_worker):
         """Command accepts custom backend name."""
-        with patch("django_tasks_concurrent.management.commands.concurrent_worker.ConcurrentWorker") as mock_worker:
-            with patch("django_tasks_concurrent.management.commands.concurrent_worker.asyncio.run"):
-                mock_instance = MagicMock()
-                mock_worker.return_value = mock_instance
+        call_command("concurrent_worker", backend="secondary", stdout=StringIO())
 
-                out = StringIO()
-                call_command("concurrent_worker", backend="secondary", stdout=out)
+        assert run_worker.call_args.kwargs["backend_name"] == "secondary"
 
-                assert mock_worker.call_args[1]["backend_name"] == "secondary"
+    def test_command_custom_scheduler_interval(self, run_worker):
+        """Command accepts a custom scheduler sleep ceiling."""
+        call_command("concurrent_worker", scheduler_interval=60.0, stdout=StringIO())
 
-    def test_command_output_message(self):
+        assert run_worker.call_args.kwargs["scheduler_interval"] == 60.0
+
+    def test_command_output_message(self, run_worker):
         """Command outputs startup message."""
-        with patch("django_tasks_concurrent.management.commands.concurrent_worker.ConcurrentWorker"):
-            with patch("django_tasks_concurrent.management.commands.concurrent_worker.asyncio.run"):
-                out = StringIO()
-                call_command("concurrent_worker", concurrency=3, stdout=out)
+        out = StringIO()
+        call_command("concurrent_worker", concurrency=3, stdout=out)
 
-                output = out.getvalue()
-                assert "Starting concurrent worker" in output
-                assert "concurrency=3" in output
+        output = out.getvalue()
+        assert "Starting concurrent worker" in output
+        assert "concurrency=3" in output
 
-    def test_command_runs_worker(self):
-        """Command runs the worker via asyncio.run."""
-        with patch("django_tasks_concurrent.management.commands.concurrent_worker.ConcurrentWorker") as mock_worker:
-            with patch("django_tasks_concurrent.management.commands.concurrent_worker.asyncio.run") as mock_run:
-                mock_instance = MagicMock()
-                mock_instance.run = MagicMock()
-                mock_worker.return_value = mock_instance
+    def test_command_runs_worker(self, run_worker):
+        """Command actually starts the worker."""
+        call_command("concurrent_worker", stdout=StringIO())
 
-                out = StringIO()
-                call_command("concurrent_worker", stdout=out)
-
-                mock_run.assert_called_once_with(mock_instance.run())
+        run_worker.assert_called_once()

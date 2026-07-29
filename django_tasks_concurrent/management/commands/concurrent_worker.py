@@ -6,14 +6,13 @@ Usage:
     python manage.py concurrent_worker --concurrency=5 --interval=0.5
 """
 
-import asyncio
 import logging
 from argparse import ArgumentParser
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from django_tasks_concurrent.worker import ConcurrentWorker
+from django_tasks_concurrent.worker import run_worker
 
 logger = logging.getLogger("django_tasks_concurrent")
 
@@ -47,6 +46,12 @@ class Command(BaseCommand):
             dest="backend_name",
             help="The backend to operate on (default: 'default')",
         )
+        parser.add_argument(
+            "--scheduler-interval",
+            type=float,
+            default=15.0,
+            help="Ceiling on one @periodic scheduler sleep, in seconds (default: 15.0)",
+        )
 
     def handle(
         self,
@@ -55,6 +60,7 @@ class Command(BaseCommand):
         interval: float,
         queue_name: str,
         backend_name: str,
+        scheduler_interval: float,
         verbosity: int,
         **options,
     ):
@@ -72,10 +78,10 @@ class Command(BaseCommand):
         queue_name = queue_name or getattr(settings, "TASK_QUEUE_NAME", "default")
         self.stdout.write(f"Starting concurrent worker (concurrency={concurrency}, queue={queue_name})")
 
-        worker = ConcurrentWorker(
+        run_worker(
             concurrency=concurrency,
             interval=interval,
             queue_name=queue_name,
             backend_name=backend_name,
+            scheduler_interval=scheduler_interval,
         )
-        asyncio.run(worker.run())

@@ -11,6 +11,9 @@ from django.db.utils import OperationalError
 
 from django_tasks_concurrent.worker import ConcurrentWorker
 
+# Patched where the worker looks it up, not where it is defined.
+SCHEDULER_LOOP = "django_tasks_concurrent.worker.defer_periodic_forever"
+
 
 class TestConcurrentWorkerInit:
     """Tests for ConcurrentWorker initialization."""
@@ -226,14 +229,75 @@ class TestConcurrentWorkerRun:
         worker.running = False  # Stop immediately
 
         with patch.object(worker, "_sub_worker", new_callable=AsyncMock) as mock_sub:
-            with patch("asyncio.get_event_loop") as mock_loop:
-                mock_loop.return_value.add_signal_handler = MagicMock()
-                await worker.run()
+            with patch(SCHEDULER_LOOP, new_callable=AsyncMock):
+                with patch("asyncio.get_event_loop") as mock_loop:
+                    mock_loop.return_value.add_signal_handler = MagicMock()
+                    await worker.run()
 
         # Should have started 2 sub-workers
         assert mock_sub.call_count == 2
         mock_sub.assert_any_call(0)
         mock_sub.assert_any_call(1)
+
+
+class TestConcurrentWorkerSchedules:
+    """A worker schedules as well as executes — that is the whole contract of @periodic."""
+
+    @pytest.mark.asyncio
+    async def test_it_starts_the_scheduler_without_being_asked(self, worker_config):
+        """No flag, no second process: running a worker is all a @periodic task should need."""
+        worker = ConcurrentWorker(**worker_config)
+        worker.running = False
+
+        with patch.object(worker, "_sub_worker", new_callable=AsyncMock):
+            with patch(SCHEDULER_LOOP, new_callable=AsyncMock) as mock_scheduler:
+                with patch("asyncio.get_event_loop") as mock_loop:
+                    mock_loop.return_value.add_signal_handler = MagicMock()
+                    await worker.run()
+
+        mock_scheduler.assert_called_once_with(worker.scheduler_interval)
+
+    @pytest.mark.asyncio
+    async def test_run_returns_even_though_the_scheduler_never_does(self, worker_config):
+        """The regression that made this a side task: the scheduler loops forever, so holding run()
+        open until it finishes hangs the worker on every exit that isn't a signal."""
+        worker = ConcurrentWorker(**worker_config)
+        worker.running = False
+
+        async def never_returns(_interval):
+            await asyncio.Event().wait()
+
+        with patch.object(worker, "_sub_worker", new_callable=AsyncMock):
+            with patch(SCHEDULER_LOOP, side_effect=never_returns):
+                with patch("asyncio.get_event_loop") as mock_loop:
+                    mock_loop.return_value.add_signal_handler = MagicMock()
+                    await asyncio.wait_for(worker.run(), timeout=5)
+
+        # run() returning at all is the assertion; this pins that it returned by CANCELLING the
+        # scheduler rather than orphaning it to keep polling after the worker is gone.
+        with pytest.raises(asyncio.CancelledError):
+            await worker.scheduler_task
+
+    @pytest.mark.asyncio
+    async def test_a_dead_scheduler_stops_the_worker(self, worker_config):
+        """A worker that quietly stopped scheduling looks healthy while every @periodic task stops
+        firing. Exiting is the honest failure."""
+        worker = ConcurrentWorker(**worker_config)
+
+        async def dies_immediately(_interval):
+            raise RuntimeError("scheduler is done for")
+
+        async def sub_worker_until_stopped(_worker_num):
+            while worker.running:
+                await asyncio.sleep(0.01)
+
+        with patch.object(worker, "_sub_worker", side_effect=sub_worker_until_stopped):
+            with patch(SCHEDULER_LOOP, side_effect=dies_immediately):
+                with patch("asyncio.get_event_loop") as mock_loop:
+                    mock_loop.return_value.add_signal_handler = MagicMock()
+                    await asyncio.wait_for(worker.run(), timeout=5)
+
+        assert worker.running is False
 
 
 class TestConcurrentExecution:

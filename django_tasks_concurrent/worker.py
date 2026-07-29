@@ -3,13 +3,19 @@ Concurrent async worker for Django Tasks.
 
 Runs multiple async tasks concurrently using asyncio TaskGroup.
 While one task awaits I/O, others can execute.
+
+``run_worker`` / ``run_worker_async`` are the entry points; the management command is a thin shell
+over the first. Both take the same options, and both schedule ``@periodic`` tasks — see
+``ConcurrentWorker``.
 """
 
 import asyncio
 import logging
 import signal
+from typing import TypedDict, Unpack
 
 from asgiref.sync import sync_to_async
+from django.conf import settings
 from django.db import close_old_connections
 from django.db.utils import OperationalError
 from django_tasks.base import TaskContext
@@ -17,6 +23,8 @@ from django_tasks.signals import task_finished, task_started
 from django_tasks.utils import get_random_id
 from django_tasks_db.models import DBTaskResult
 from django_tasks_db.utils import exclusive_transaction
+
+from django_tasks_concurrent.scheduler import defer_periodic_forever
 
 logger = logging.getLogger("django_tasks_concurrent")
 
@@ -28,11 +36,18 @@ class ConcurrentWorker:
     Uses asyncio TaskGroup to manage N sub-worker coroutines.
     Each sub-worker claims and runs tasks independently.
 
+    Runs the @periodic scheduler too, as a side task beside the sub-workers. Not optional and not a
+    flag: the scheduler only enqueues, so it costs one indexed query per wake-up, and a worker is
+    exactly the thing a schedule needs in order to mean anything. With no schedules declared it does
+    nothing at all, so there is no case where making people opt in would have saved them something.
+
     Args:
         concurrency: Number of concurrent sub-workers
         interval: Polling interval in seconds when no tasks available
         queue_name: Name of the task queue to process
         backend_name: Django Tasks backend name (default: "default")
+        scheduler_interval: Ceiling on one scheduler sleep (default: 15.0). Not a poll period — the
+            scheduler wakes for the next real slot, so this only bounds how long it may sleep.
 
     Example:
         worker = ConcurrentWorker(concurrency=3, interval=1.0, queue_name="default")
@@ -45,11 +60,14 @@ class ConcurrentWorker:
         interval: float,
         queue_name: str,
         backend_name: str = "default",
+        scheduler_interval: float = 15.0,
     ):
         self.concurrency = concurrency
         self.interval = interval
         self.queue_name = queue_name
         self.backend_name = backend_name
+        self.scheduler_interval = scheduler_interval
+        self.scheduler_task = None
         self.running = True
         self.worker_id = f"concurrent-{get_random_id()}"
 
@@ -65,6 +83,15 @@ class ConcurrentWorker:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.shutdown)
 
+        # Deliberately OUTSIDE the sub-workers' task group. The scheduler never returns on its own,
+        # and a task group waits for every member — so putting it inside means any end to the
+        # sub-workers other than a signal hangs the worker forever on a loop with nothing left to
+        # feed. It is a side task: it runs beside the real work and is cancelled when that work ends.
+        self.scheduler_task = asyncio.create_task(
+            defer_periodic_forever(self.scheduler_interval), name="periodic-scheduler"
+        )
+        self.scheduler_task.add_done_callback(self.on_scheduler_finished)
+
         try:
             async with asyncio.TaskGroup() as tg:
                 for i in range(self.concurrency):
@@ -72,13 +99,33 @@ class ConcurrentWorker:
         except* Exception as eg:
             for exc in eg.exceptions:
                 logger.error(f"Sub-worker error: {exc}")
+        finally:
+            self.scheduler_task.cancel()
 
         logger.info("Concurrent worker stopped")
+
+    def on_scheduler_finished(self, scheduler_task) -> None:
+        """Stop the worker if the scheduler died on its own.
+
+        The loop swallows per-poll errors, so reaching here uncancelled means something unrecoverable
+        — and a worker that has quietly stopped scheduling looks perfectly healthy from the outside
+        while every ``@periodic`` task silently stops firing. Exiting is the honest failure.
+        """
+        if scheduler_task.cancelled():
+            return
+        scheduler_error = scheduler_task.exception()
+        if scheduler_error is not None:
+            logger.error(f"Periodic scheduler failed, stopping worker: {scheduler_error}")
+            self.shutdown()
 
     def shutdown(self) -> None:
         """Handle shutdown signal."""
         logger.info("Shutting down concurrent worker...")
         self.running = False
+        if self.scheduler_task is not None:
+            # Sub-workers notice self.running and return; the scheduler is parked in a sleep and
+            # would hold the task group open until its next wake-up, so it gets cancelled instead.
+            self.scheduler_task.cancel()
 
     async def _sub_worker(self, worker_num: int) -> None:
         """
@@ -182,3 +229,42 @@ class ConcurrentWorker:
                 await sync_to_async(task_finished.send)(sender=sender, task_result=db_task_result.task_result)
             except Exception:
                 logger.exception("Failed to send task_finished signal")
+
+
+class WorkerOptions(TypedDict, total=False):
+    """Every option the worker takes.
+
+    One TypedDict shared by both entry points, so the sync and async forms cannot drift into
+    documenting different surfaces.
+    """
+
+    concurrency: int
+    interval: float
+    queue_name: str
+    backend_name: str
+    scheduler_interval: float
+
+
+async def run_worker_async(**options: Unpack[WorkerOptions]) -> None:
+    """Run the worker until it is shut down. The real entry point; ``run_worker`` wraps it.
+
+    Use this from code that already owns an event loop. ``queue_name`` defaults to
+    ``settings.TASK_QUEUE_NAME`` so a deployment names its queue once, in settings, instead of at
+    every call site.
+    """
+    worker = ConcurrentWorker(
+        concurrency=options.get("concurrency", 3),
+        interval=options.get("interval", 1.0),
+        queue_name=options.get("queue_name") or getattr(settings, "TASK_QUEUE_NAME", "default"),
+        backend_name=options.get("backend_name", "default"),
+        scheduler_interval=options.get("scheduler_interval", 15.0),
+    )
+    await worker.run()
+
+
+def run_worker(**options: Unpack[WorkerOptions]) -> None:
+    """Synchronous version of ``run_worker_async`` — creates the event loop and runs the worker in it.
+
+    This is what a management command or an entry-point script wants. Same options, same behaviour.
+    """
+    asyncio.run(run_worker_async(**options))
