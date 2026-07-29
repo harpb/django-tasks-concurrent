@@ -6,6 +6,7 @@ task exactly once, a new slot must queue it again, a slot older than the max del
 entirely, and no single broken schedule may stop the others from firing.
 """
 
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -18,9 +19,9 @@ from django_tasks_concurrent import periodic
 from django_tasks_concurrent.models import PeriodicDefer
 from django_tasks_concurrent.periodic_tasks import PERIODIC_TASKS, PeriodicTask, registered_periodic_tasks
 from django_tasks_concurrent.scheduler import (
-    Scheduler,
     defer_periodic_tasks,
     prune_periodic_defers,
+    run_scheduler_thread,
     seconds_until_next_slot,
 )
 
@@ -253,12 +254,16 @@ class TestSecondsUntilNextSlot:
         assert seconds_until_next_slot(timezone.now(), max_sleep=3600) >= 0
 
 
-class TestScheduler:
-    async def test_poll_forever_exits_once_shut_down(self):
-        """The in-worker path installs no signal handlers — shutdown() has to be what stops it."""
-        scheduler = Scheduler(interval=0.01)
-        scheduler.shutdown()
+class TestSchedulerThread:
+    def test_it_runs_as_a_daemon_and_stops_on_its_event(self):
+        """It rides inside someone else's worker, so the stop event is the only way to end it — and
+        being a daemon is what keeps it from holding up that worker's shutdown."""
+        stop_event = run_scheduler_thread(interval=0.01)
+        thread = next(t for t in threading.enumerate() if t.name == "periodic-scheduler")
 
-        await scheduler.poll_forever()
+        assert thread.daemon is True
 
-        assert scheduler.running is False
+        stop_event.set()
+        thread.join(timeout=5)
+
+        assert thread.is_alive() is False

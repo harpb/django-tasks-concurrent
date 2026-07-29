@@ -15,13 +15,10 @@ hundreds. Only the most recent slot is ever considered, which is what makes repe
 one slot idempotent.
 """
 
-import asyncio
 import logging
-import signal
 import threading
 from datetime import timedelta
 
-from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import IntegrityError, close_old_connections, transaction
 from django.utils import timezone
@@ -70,8 +67,8 @@ def seconds_until_next_slot(now=None, max_sleep: float = 15.0) -> float:
 def defer_periodic_tasks(now=None) -> int:
     """Queue every declared schedule whose current slot hasn't been queued yet. Returns how many fired.
 
-    Synchronous and self-contained so it works from a management command, a test, or the async poll
-    loop alike. Each schedule is claimed independently — one broken schedule cannot stop the others.
+    Synchronous and self-contained so it works from the poll loop, a test, or a one-off sweep alike.
+    Each schedule is claimed independently — one broken schedule cannot stop the others.
     """
     now = now or timezone.now()
     cutoff = now - timedelta(seconds=max_delay_seconds())
@@ -123,11 +120,14 @@ def prune_periodic_defers(now) -> int:
 def run_scheduler_thread(interval: float = 15.0) -> threading.Event:
     """Run the scheduler on a daemon thread and return its stop event.
 
-    For hosting the scheduler inside a worker that isn't ours — Django's own ``db_worker``, or a
-    wrapper around it — where there's no hook to add a coroutine to. The loop is plain synchronous
-    rather than ``Scheduler.poll_forever``: ``asyncio``'s signal handlers can only be installed from
-    the main thread, and a sweep is one indexed query, so there is nothing here that needs an event
-    loop. ``interval`` is the ceiling on one sleep, not a poll period — see ``seconds_until_next_slot``.
+    This is the only way to start the scheduler, and it is deliberately one function rather than a
+    process of its own: a sweep is a single indexed query, and the scheduler is useless without a
+    worker to drain what it queues, so it belongs beside whichever worker you already run — ours,
+    Django's ``db_worker``, or a wrapper around either. Call it once at worker startup.
+
+    The loop is plain synchronous, not a coroutine: there is nothing here to await, and ``asyncio``
+    signal handlers can only be installed from the main thread anyway. ``interval`` is the ceiling on
+    one sleep, not a poll period — see ``seconds_until_next_slot``.
 
     Daemon, so it never keeps the process alive at shutdown. Swallows everything — a scheduler
     problem must not take down the worker it rides in.
@@ -146,53 +146,6 @@ def run_scheduler_thread(interval: float = 15.0) -> threading.Event:
                 close_old_connections()
             stop_event.wait(seconds_until_next_slot(max_sleep=interval))
 
+    logger.info(f"Starting scheduler interval={interval} schedules={len(registered_periodic_tasks())}")
     threading.Thread(target=poll_until_stopped, name="periodic-scheduler", daemon=True).start()
     return stop_event
-
-
-class Scheduler:
-    """Poll the declared schedules forever, queueing whatever has come due.
-
-    It sleeps to the next real slot rather than on a fixed tick, so a schedule fires within half a
-    second of its boundary whatever its cadence, and an idle registry costs no queries. ``interval``
-    is only the CEILING on one sleep — it does not need tuning against your tightest cron.
-    """
-
-    def __init__(self, interval: float = 15.0):
-        self.interval = interval
-        self.running = True
-
-    async def run(self) -> None:
-        """Main entry point — poll until shut down."""
-        logger.info(f"Starting scheduler interval={self.interval} schedules={len(registered_periodic_tasks())}")
-
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, self.shutdown)
-            except NotImplementedError:
-                # add_signal_handler is Unix-only; on Windows the default KeyboardInterrupt is enough.
-                pass
-
-        await self.poll_forever()
-        logger.info("Scheduler stopped")
-
-    async def poll_forever(self) -> None:
-        """The poll loop, split out so ``concurrent_worker`` can run it inside its own TaskGroup."""
-        while self.running:
-            try:
-                fired = await sync_to_async(defer_periodic_tasks)()
-                if fired:
-                    logger.debug(f"Scheduler deferred {fired} periodic task(s)")
-            except Exception as scheduler_error:
-                logger.exception(f"Scheduler poll failed: {scheduler_error}")
-            finally:
-                # Same reasoning as the worker's sub-loop: a connection dropped by the database has to
-                # be discarded on the error path too, or every later poll reuses the dead one.
-                await sync_to_async(close_old_connections)()
-            await asyncio.sleep(seconds_until_next_slot(max_sleep=self.interval))
-
-    def shutdown(self) -> None:
-        """Handle shutdown signal."""
-        logger.info("Shutting down scheduler...")
-        self.running = False

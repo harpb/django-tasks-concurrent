@@ -64,17 +64,7 @@ def cleanup_foobar(timestamp: int):
 
 `@periodic` goes **above** `@task` and hands the task straight back, so `cleanup_foobar.enqueue()` still works and the decorated name is still the ordinary task object.
 
-**Running a worker is all it takes** — `concurrent_worker` schedules by default, so there is no beat process to deploy and forget:
-
-```bash
-python manage.py concurrent_worker           # works and schedules
-python manage.py concurrent_worker --no-scheduler
-python manage.py task_scheduler --list       # what's registered?
-python manage.py task_scheduler --once       # sweep once and exit
-python manage.py task_scheduler              # standalone, if you'd rather split them
-```
-
-Hosting it in a worker you don't control (Django's own `db_worker`, or a wrapper around it) takes one call:
+**Starting the scheduler is one call, made once at worker startup:**
 
 ```bash
 from django_tasks_concurrent.scheduler import run_scheduler_thread
@@ -82,7 +72,19 @@ from django_tasks_concurrent.scheduler import run_scheduler_thread
 run_scheduler_thread()   # daemon thread, returns a stop event
 ```
 
-The scheduler only *enqueues* — it never runs task code — so it costs one indexed query per wake-up and, being off the execution path, can't drift behind a long-running job.
+That is the only entry point, and deliberately so. A sweep is a single indexed query, and the scheduler is useless without a worker to drain what it queues — so it belongs *inside* whichever worker you already run rather than as a process of its own. It works the same in `concurrent_worker`, Django's own `db_worker`, or a wrapper around either; there is no beat process to deploy and forget, and no flag to remember.
+
+The scheduler only *enqueues* — it never runs task code — so it costs one indexed query per wake-up and, being off the execution path, can't drift behind a long-running job. Being a daemon thread, it never holds up shutdown, and it swallows its own errors so a scheduling problem can't take down the worker hosting it.
+
+To check what's registered, or to sweep once from a shell or an external timer:
+
+```bash
+from django_tasks_concurrent.periodic_tasks import registered_periodic_tasks
+from django_tasks_concurrent.scheduler import defer_periodic_tasks
+
+[entry.title for entry in registered_periodic_tasks()]
+defer_periodic_tasks()   # queue whatever is due, return how many fired
+```
 
 ### Cron syntax
 
@@ -104,11 +106,11 @@ Pass `periodic_id` when the same task is scheduled more than once — it's what 
 - **No catch-up.** Only the most recent slot is considered, and a slot older than `PERIODIC_MAX_DELAY_SECONDS` (default 600) is skipped — a machine asleep overnight wakes up and runs once, not three hundred times.
 - **At-least-once execution, not exactly-once.** The claim and the enqueue share a transaction, so a failed enqueue rolls back its claim and the slot retries on the next poll.
 
-The scheduler sleeps until the next real slot rather than polling on a tick, so a schedule fires within half a second of its boundary whatever its cadence, and an idle registry costs no queries at all. `--interval` (default 15s) is only the **ceiling** on a single sleep — it needs no tuning against your tightest cron.
+The scheduler sleeps until the next real slot rather than polling on a tick, so a schedule fires within half a second of its boundary whatever its cadence, and an idle registry costs no queries at all. `run_scheduler_thread(interval=...)` (default 15s) is only the **ceiling** on a single sleep — it needs no tuning against your tightest cron.
 
 ### Registration
 
-Schedules only exist once the module holding them is imported. The app config autodiscovers every app's `tasks` module on startup for exactly this reason — put `@periodic` tasks in `tasks.py` and they register themselves. `task_scheduler --list` is the fastest way to confirm.
+Schedules only exist once the module holding them is imported. The app config autodiscovers every app's `tasks` module on startup for exactly this reason — put `@periodic` tasks in `tasks.py` and they register themselves. `registered_periodic_tasks()` is the fastest way to confirm.
 
 Requires a migration: `python manage.py migrate django_tasks_concurrent`.
 

@@ -11,8 +11,6 @@ Two pieces, usable together or apart:
 
 Usage:
     python manage.py concurrent_worker --concurrency=3
-    python manage.py concurrent_worker --concurrency=3 --with-scheduler
-    python manage.py task_scheduler
 
     from django_tasks import task
     from django_tasks_concurrent import periodic
@@ -21,9 +19,14 @@ Usage:
     @task()
     def cleanup_foobar(timestamp: int):
         ...
+
+    # once at worker startup, in whichever worker you run
+    from django_tasks_concurrent.scheduler import run_scheduler_thread
+
+    run_scheduler_thread()
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 def __getattr__(name: str):
@@ -39,17 +42,12 @@ def __getattr__(name: str):
         from django_tasks_concurrent import periodic_tasks  # noqa: PLC0415
 
         return getattr(periodic_tasks, name)
-    if name == "Scheduler":
-        from django_tasks_concurrent.scheduler import Scheduler  # noqa: PLC0415
-
-        return Scheduler
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "ConcurrentWorker",
     "PeriodicTask",
-    "Scheduler",
     "__version__",
     "periodic",
     "registered_periodic_tasks",

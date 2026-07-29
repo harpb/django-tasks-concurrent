@@ -33,9 +33,6 @@ class ConcurrentWorker:
         interval: Polling interval in seconds when no tasks available
         queue_name: Name of the task queue to process
         backend_name: Django Tasks backend name (default: "default")
-        scheduler: Optional Scheduler to sweep the @periodic schedules alongside the sub-workers.
-            Convenience for deployments that don't want a second process — the scheduler only
-            enqueues, so it costs one indexed query per poll and never blocks a sub-worker.
 
     Example:
         worker = ConcurrentWorker(concurrency=3, interval=1.0, queue_name="default")
@@ -48,13 +45,11 @@ class ConcurrentWorker:
         interval: float,
         queue_name: str,
         backend_name: str = "default",
-        scheduler=None,
     ):
         self.concurrency = concurrency
         self.interval = interval
         self.queue_name = queue_name
         self.backend_name = backend_name
-        self.scheduler = scheduler
         self.running = True
         self.worker_id = f"concurrent-{get_random_id()}"
 
@@ -74,9 +69,6 @@ class ConcurrentWorker:
             async with asyncio.TaskGroup() as tg:
                 for i in range(self.concurrency):
                     tg.create_task(self._sub_worker(i))
-                if self.scheduler is not None:
-                    logger.info("Running the cron scheduler in-process")
-                    tg.create_task(self.scheduler.poll_forever())
         except* Exception as eg:
             for exc in eg.exceptions:
                 logger.error(f"Sub-worker error: {exc}")
@@ -87,10 +79,6 @@ class ConcurrentWorker:
         """Handle shutdown signal."""
         logger.info("Shutting down concurrent worker...")
         self.running = False
-        if self.scheduler is not None:
-            # The scheduler shares this process's TaskGroup, so its own signal handlers were never
-            # installed — the group would hang on its poll loop if we didn't stop it here too.
-            self.scheduler.shutdown()
 
     async def _sub_worker(self, worker_num: int) -> None:
         """
