@@ -84,9 +84,19 @@ Scheduling isn't optional because there's nothing to opt out of: the scheduler o
 
 It runs as a **side task** beside the sub-workers, which means it shares their fate in both directions. Shutting the worker down cancels it. And if the scheduler itself dies, the worker stops rather than carrying on — a worker that has quietly stopped scheduling looks perfectly healthy from the outside while every `@periodic` task silently stops firing.
 
-### Hosting the scheduler in a worker this package doesn't own
+### Not using the concurrent worker? `task_worker`
 
-`db_worker` is upstream code with no hook to run anything alongside its loop, so there it takes one call at startup:
+If you want the plain sequential worker, run `task_worker` rather than `db_worker` — it delegates to `db_worker` and adds the two things a deployment ends up adding anyway:
+
+```bash
+python manage.py task_worker                 # schedules, and reconnects
+python manage.py task_worker --no-scheduler  # several workers, one schedule
+python manage.py task_worker --no-reload     # don't restart on code edits
+```
+
+Scheduling is a *flag* here, unlike `concurrent_worker` where it's unconditional. The difference is ownership: this command hands control to upstream `db_worker` and gets it back only at shutdown, so the schedule rides a daemon thread nobody supervises — and being able to say "not this process" is what lets you run several workers and schedule from only one. For the same reason, a scheduler that fails to start is logged and skipped rather than stopping the worker: it's a passenger here, not part of the machine.
+
+To host the scheduler in some other worker entirely, or on a thread of your own:
 
 ```bash
 from django_tasks_concurrent.scheduler import run_scheduler_thread
@@ -94,7 +104,19 @@ from django_tasks_concurrent.scheduler import run_scheduler_thread
 run_scheduler_thread()   # daemon thread, returns a stop event
 ```
 
-This is the one place the failure trade goes the other way: as a guest in someone else's worker it swallows its errors rather than taking that worker down with it.
+### Surviving a database that blinks
+
+`db_worker`'s poll loop only catches SQLite's "database is locked". Every other database error — including the `OperationalError` a dropped connection raises at COMMIT — propagates out of `run()` and exits the process. That's fine when the database is a local file and merciless when it's on another host, where a container restart or an idle reap is routine.
+
+`task_worker` installs the fix for you. If you build a `Worker` yourself (on a thread, say), install it directly:
+
+```bash
+from django_tasks_concurrent import install_resilient_run
+
+install_resilient_run()   # patches Worker.run; idempotent
+```
+
+Those errors then force a fresh connection, back off exponentially to 30s, and re-enter the poll loop. A shutdown that races the error is re-raised rather than retried over.
 
 To check what's registered, or to sweep once from a shell or an external timer:
 

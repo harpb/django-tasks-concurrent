@@ -11,6 +11,7 @@ Two pieces, usable together or apart:
 
 Usage:
     python manage.py concurrent_worker --concurrency=3
+    python manage.py task_worker              # sequential db_worker, scheduling + reconnect
 
     from django_tasks_concurrent import run_worker, run_worker_async
 
@@ -39,6 +40,10 @@ def __getattr__(name: str):
         from django_tasks_concurrent import worker  # noqa: PLC0415
 
         return getattr(worker, name)
+    if name == "install_resilient_run":
+        from django_tasks_concurrent.db_worker import install_resilient_run  # noqa: PLC0415
+
+        return install_resilient_run
     if name in {"periodic", "PeriodicTask", "registered_periodic_tasks"}:
         # The module is periodic_tasks, NOT periodic: a submodule named `periodic` would be set as an
         # attribute of this package on first import and shadow the decorator, so
@@ -54,6 +59,7 @@ __all__ = [
     "PeriodicTask",
     "WorkerOptions",
     "__version__",
+    "install_resilient_run",
     "periodic",
     "registered_periodic_tasks",
     "run_worker",
