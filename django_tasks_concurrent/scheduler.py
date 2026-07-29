@@ -1,0 +1,198 @@
+"""
+The periodic scheduler.
+
+Sweeps the schedules declared with ``@periodic`` and queues any whose slot has arrived. It only
+enqueues — it never runs task code — so it stays cheap and its poll cadence can't drift behind a long
+job. Whatever worker you already run executes the result.
+
+Safe in any number of processes. Each slot is claimed by inserting one row into ``PeriodicDefer``
+under a unique constraint, so the database decides the winner; a loser catches IntegrityError and
+moves on. There is no lock to wait on and no leader to elect.
+
+Missed slots are not replayed. A slot more than ``PERIODIC_MAX_DELAY_SECONDS`` old is skipped, so a
+machine that was asleep overnight comes back and runs the current slot once instead of catching up on
+hundreds. Only the most recent slot is ever considered, which is what makes repeated sweeps within
+one slot idempotent.
+"""
+
+import asyncio
+import logging
+import signal
+import threading
+from datetime import timedelta
+
+from asgiref.sync import sync_to_async
+from django.conf import settings
+from django.db import IntegrityError, close_old_connections, transaction
+from django.utils import timezone
+
+from django_tasks_concurrent.models import PeriodicDefer
+from django_tasks_concurrent.periodic_tasks import PeriodicTask, registered_periodic_tasks
+
+logger = logging.getLogger("django_tasks_concurrent")
+
+# A slot older than this is never queued — the scheduler was down, and running a stale slot now is
+# almost never what the schedule meant. Matches Procrastinate's 10-minute default.
+DEFAULT_MAX_DELAY_SECONDS = 600
+
+# Ledger rows only exist to suppress a duplicate defer, so they are useless once no live slot could
+# still collide with them. Pruned lazily, and only on a sweep that actually deferred something.
+DEFER_RETENTION_DAYS = 7
+
+
+# Deliberate oversleep so a wake-up lands just PAST the slot boundary rather than a hair before it,
+# which would burn a whole extra poll discovering nothing is due yet.
+TICK_MARGIN_SECONDS = 0.5
+
+
+def max_delay_seconds() -> int:
+    return getattr(settings, "PERIODIC_MAX_DELAY_SECONDS", DEFAULT_MAX_DELAY_SECONDS)
+
+
+def seconds_until_next_slot(now=None, max_sleep: float = 15.0) -> float:
+    """How long the scheduler may sleep before something is actually due.
+
+    Sleeping to the next real slot instead of on a fixed tick is what makes a ``* * * * *`` task fire
+    within half a second of the minute rather than up to a poll-interval late — and it means an idle
+    registry costs no queries at all. ``max_sleep`` caps it so a once-a-day schedule doesn't commit
+    the process to a 24-hour sleep that a clock change or a suspend would invalidate, and so an empty
+    registry still ticks.
+    """
+    now = now or timezone.now()
+    entries = registered_periodic_tasks()
+    if not entries:
+        return max_sleep
+
+    soonest = min(entry.next_slot(now) for entry in entries)
+    return max(0.0, min((soonest - now).total_seconds() + TICK_MARGIN_SECONDS, max_sleep))
+
+
+def defer_periodic_tasks(now=None) -> int:
+    """Queue every declared schedule whose current slot hasn't been queued yet. Returns how many fired.
+
+    Synchronous and self-contained so it works from a management command, a test, or the async poll
+    loop alike. Each schedule is claimed independently — one broken schedule cannot stop the others.
+    """
+    now = now or timezone.now()
+    cutoff = now - timedelta(seconds=max_delay_seconds())
+
+    fired = 0
+    for entry in registered_periodic_tasks():
+        try:
+            if defer_one(entry, now, cutoff):
+                fired += 1
+        except Exception as schedule_error:
+            logger.exception(f"Periodic task {entry.title} could not be deferred: {schedule_error}")
+
+    if fired:
+        prune_periodic_defers(now)
+    return fired
+
+
+def defer_one(entry: PeriodicTask, now, cutoff) -> bool:
+    """Claim ``entry``'s current slot and queue it. Returns whether it fired.
+
+    The ledger insert and the enqueue share one transaction: if enqueueing raises, the claim rolls
+    back too, so the next sweep retries the slot instead of silently swallowing it. IntegrityError is
+    caught OUTSIDE the atomic block on purpose — a failed statement poisons the surrounding
+    transaction, so it cannot be handled from inside it.
+    """
+    slot = entry.current_slot(now)
+    if slot < cutoff:
+        logger.debug(f"Skipping stale slot {slot} for {entry.title}")
+        return False
+
+    try:
+        with transaction.atomic():
+            PeriodicDefer.objects.create(task_name=entry.task_name, periodic_id=entry.periodic_id, defer_at=slot)
+            entry.bound_task.enqueue(timestamp=int(slot.timestamp()), **entry.task_kwargs)
+    except IntegrityError:
+        # Another scheduler already claimed this slot. Expected, not an error.
+        return False
+
+    logger.info(f"Deferred periodic task {entry.title} for slot {slot}")
+    return True
+
+
+def prune_periodic_defers(now) -> int:
+    """Drop ledger rows too old to suppress anything, and return how many went."""
+    deleted, _ = PeriodicDefer.objects.filter(created__lt=now - timedelta(days=DEFER_RETENTION_DAYS)).delete()
+    return deleted
+
+
+def run_scheduler_thread(interval: float = 15.0) -> threading.Event:
+    """Run the scheduler on a daemon thread and return its stop event.
+
+    For hosting the scheduler inside a worker that isn't ours — Django's own ``db_worker``, or a
+    wrapper around it — where there's no hook to add a coroutine to. The loop is plain synchronous
+    rather than ``Scheduler.poll_forever``: ``asyncio``'s signal handlers can only be installed from
+    the main thread, and a sweep is one indexed query, so there is nothing here that needs an event
+    loop. ``interval`` is the ceiling on one sleep, not a poll period — see ``seconds_until_next_slot``.
+
+    Daemon, so it never keeps the process alive at shutdown. Swallows everything — a scheduler
+    problem must not take down the worker it rides in.
+    """
+    stop_event = threading.Event()
+
+    def poll_until_stopped():
+        while not stop_event.is_set():
+            try:
+                fired = defer_periodic_tasks()
+                if fired:
+                    logger.debug(f"Scheduler deferred {fired} periodic task(s)")
+            except Exception as scheduler_error:
+                logger.exception(f"Scheduler poll failed: {scheduler_error}")
+            finally:
+                close_old_connections()
+            stop_event.wait(seconds_until_next_slot(max_sleep=interval))
+
+    threading.Thread(target=poll_until_stopped, name="periodic-scheduler", daemon=True).start()
+    return stop_event
+
+
+class Scheduler:
+    """Poll the declared schedules forever, queueing whatever has come due.
+
+    It sleeps to the next real slot rather than on a fixed tick, so a schedule fires within half a
+    second of its boundary whatever its cadence, and an idle registry costs no queries. ``interval``
+    is only the CEILING on one sleep — it does not need tuning against your tightest cron.
+    """
+
+    def __init__(self, interval: float = 15.0):
+        self.interval = interval
+        self.running = True
+
+    async def run(self) -> None:
+        """Main entry point — poll until shut down."""
+        logger.info(f"Starting scheduler interval={self.interval} schedules={len(registered_periodic_tasks())}")
+
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self.shutdown)
+            except NotImplementedError:
+                # add_signal_handler is Unix-only; on Windows the default KeyboardInterrupt is enough.
+                pass
+
+        await self.poll_forever()
+        logger.info("Scheduler stopped")
+
+    async def poll_forever(self) -> None:
+        """The poll loop, split out so ``concurrent_worker`` can run it inside its own TaskGroup."""
+        while self.running:
+            try:
+                fired = await sync_to_async(defer_periodic_tasks)()
+                if fired:
+                    logger.debug(f"Scheduler deferred {fired} periodic task(s)")
+            except Exception as scheduler_error:
+                logger.exception(f"Scheduler poll failed: {scheduler_error}")
+            finally:
+                # Same reasoning as the worker's sub-loop: a connection dropped by the database has to
+                # be discarded on the error path too, or every later poll reuses the dead one.
+                await sync_to_async(close_old_connections)()
+            await asyncio.sleep(seconds_until_next_slot(max_sleep=self.interval))
+
+    def shutdown(self) -> None:
+        """Handle shutdown signal."""
+        logger.info("Shutting down scheduler...")
+        self.running = False

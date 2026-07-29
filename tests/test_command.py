@@ -21,12 +21,25 @@ class TestConcurrentWorkerCommand:
                 out = StringIO()
                 call_command("concurrent_worker", stdout=out)
 
-                mock_worker.assert_called_once_with(
-                    concurrency=3,
-                    interval=1.0,
-                    queue_name="default",
-                    backend_name="default",
-                )
+                # The scheduler is ON by default — running a worker is all it should take for a
+                # @periodic task to fire, which is how Procrastinate does it too. With an empty
+                # registry it costs nothing, so there's no reason to make people opt in.
+                call_kwargs = mock_worker.call_args.kwargs
+                assert call_kwargs["concurrency"] == 3
+                assert call_kwargs["interval"] == 1.0
+                assert call_kwargs["queue_name"] == "default"
+                assert call_kwargs["backend_name"] == "default"
+                assert call_kwargs["scheduler"] is not None
+
+    def test_no_scheduler_opts_out(self):
+        """--no-scheduler gives back exactly the worker this command was before periodic tasks."""
+        with patch("django_tasks_concurrent.management.commands.concurrent_worker.ConcurrentWorker") as mock_worker:
+            with patch("django_tasks_concurrent.management.commands.concurrent_worker.asyncio.run"):
+                mock_worker.return_value = MagicMock()
+
+                call_command("concurrent_worker", "--no-scheduler", stdout=StringIO())
+
+                assert mock_worker.call_args.kwargs["scheduler"] is None
 
     def test_command_custom_concurrency(self):
         """Command accepts custom concurrency."""

@@ -8,11 +8,12 @@ Usage:
 
 import asyncio
 import logging
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
+from django_tasks_concurrent.scheduler import Scheduler
 from django_tasks_concurrent.worker import ConcurrentWorker
 
 logger = logging.getLogger("django_tasks_concurrent")
@@ -47,6 +48,19 @@ class Command(BaseCommand):
             dest="backend_name",
             help="The backend to operate on (default: 'default')",
         )
+        parser.add_argument(
+            "--scheduler",
+            action=BooleanOptionalAction,
+            default=True,
+            dest="with_scheduler",
+            help="Run the @periodic scheduler in this process (default: on; --no-scheduler disables)",
+        )
+        parser.add_argument(
+            "--scheduler-interval",
+            type=float,
+            default=15.0,
+            help="Seconds between schedule polls when --with-scheduler is set (default: 15.0)",
+        )
 
     def handle(
         self,
@@ -55,6 +69,8 @@ class Command(BaseCommand):
         interval: float,
         queue_name: str,
         backend_name: str,
+        with_scheduler: bool,
+        scheduler_interval: float,
         verbosity: int,
         **options,
     ):
@@ -72,10 +88,16 @@ class Command(BaseCommand):
         queue_name = queue_name or getattr(settings, "TASK_QUEUE_NAME", "default")
         self.stdout.write(f"Starting concurrent worker (concurrency={concurrency}, queue={queue_name})")
 
+        scheduler = None
+        if with_scheduler:
+            scheduler = Scheduler(interval=scheduler_interval)
+            self.stdout.write(f"Periodic scheduler enabled (poll every {scheduler_interval}s)")
+
         worker = ConcurrentWorker(
             concurrency=concurrency,
             interval=interval,
             queue_name=queue_name,
             backend_name=backend_name,
+            scheduler=scheduler,
         )
         asyncio.run(worker.run())
