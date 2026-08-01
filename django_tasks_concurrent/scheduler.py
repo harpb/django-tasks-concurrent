@@ -6,8 +6,8 @@ enqueues — it never runs task code — so it stays cheap and its poll cadence 
 job. Whatever worker you already run executes the result.
 
 Safe in any number of processes. Each slot is claimed by inserting one row into ``PeriodicDefer``
-under a unique constraint, so the database decides the winner; a loser catches IntegrityError and
-moves on. There is no lock to wait on and no leader to elect.
+under a unique constraint, so the database decides the winner; a loser inserts nothing and moves on.
+There is no lock to wait on and no leader to elect.
 
 Missed slots are not replayed. A slot more than ``PERIODIC_MAX_DELAY_SECONDS`` old is skipped, so a
 machine that was asleep overnight comes back and runs the current slot once instead of catching up on
@@ -92,9 +92,11 @@ def defer_one(entry: PeriodicTask, now, cutoff) -> bool:
     """Claim ``entry``'s current slot and queue it. Returns whether it fired.
 
     The ledger insert and the enqueue share one transaction: if enqueueing raises, the claim rolls
-    back too, so the next sweep retries the slot instead of silently swallowing it. IntegrityError is
-    caught OUTSIDE the atomic block on purpose — a failed statement poisons the surrounding
-    transaction, so it cannot be handled from inside it.
+    back too, so the next sweep retries the slot instead of silently swallowing it. Losing the claim
+    is not an error and does not raise — see ``PeriodicDeferManager.claim_slot``. IntegrityError is
+    still caught, OUTSIDE the atomic block on purpose: backends that can't do a conflict-free insert
+    fall back to one that fails, and a failed statement poisons the surrounding transaction, so it
+    cannot be handled from inside it.
     """
     slot = entry.current_slot(now)
     if slot < cutoff:
@@ -103,10 +105,14 @@ def defer_one(entry: PeriodicTask, now, cutoff) -> bool:
 
     try:
         with transaction.atomic():
-            PeriodicDefer.objects.create(task_name=entry.task_name, periodic_id=entry.periodic_id, defer_at=slot)
+            claimed = PeriodicDefer.objects.claim_slot(
+                task_name=entry.task_name, periodic_id=entry.periodic_id, defer_at=slot, created=now
+            )
+            if not claimed:
+                # Another scheduler already claimed this slot. Expected, not an error.
+                return False
             entry.bound_task.enqueue(timestamp=int(slot.timestamp()), **entry.task_kwargs)
     except IntegrityError:
-        # Another scheduler already claimed this slot. Expected, not an error.
         return False
 
     logger.info(f"Deferred periodic task {entry.title} for slot {slot}")

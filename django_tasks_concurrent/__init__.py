@@ -31,7 +31,7 @@ NOT own (Django's own ``db_worker``) needs the schedule started by hand, with
 ``scheduler.run_scheduler_thread()``.
 """
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 
 def __getattr__(name: str):

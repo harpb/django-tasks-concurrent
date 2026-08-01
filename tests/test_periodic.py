@@ -10,6 +10,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from django.db import transaction
 from django.test import override_settings
 from django.utils import timezone
 from django_tasks import task
@@ -164,6 +165,32 @@ class TestDeferPeriodicTasks:
         assert defer_periodic_tasks(now) == 1
         assert defer_periodic_tasks(now) == 0
         assert DBTaskResult.objects.filter(task_path=TASK_PATH).count() == 1
+
+    def test_losing_the_claim_leaves_the_transaction_usable(self):
+        """A losing claim must not be a failed statement — that would poison the open transaction
+        (and PostgreSQL would log every one of them as ERROR)."""
+        register_every_minute()
+        now = timezone.now()
+        defer_periodic_tasks(now)
+
+        with transaction.atomic():
+            claimed = PeriodicDefer.objects.claim_slot(
+                task_name=TASK_PATH, periodic_id="", defer_at=PeriodicDefer.objects.get().defer_at, created=now
+            )
+
+            assert claimed is False
+            assert PeriodicDefer.objects.count() == 1  # the connection still works inside the same transaction
+
+    def test_a_won_claim_records_the_slot_and_when_it_was_claimed(self):
+        """The claim bypasses the ORM, so auto_now_add no longer fills ``created`` for it."""
+        slot = timezone.now().replace(second=0, microsecond=0)
+        now = slot + timedelta(seconds=3)
+
+        assert PeriodicDefer.objects.claim_slot(task_name=TASK_PATH, periodic_id="local", defer_at=slot, created=now)
+
+        claim = PeriodicDefer.objects.get()
+        assert (claim.defer_at, claim.periodic_id) == (slot, "local")
+        assert claim.created == now
 
     def test_the_next_slot_queues_again(self):
         register_every_minute()
