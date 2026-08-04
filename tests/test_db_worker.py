@@ -72,6 +72,25 @@ class TestInstallResilientRun:
         waits = [call.args[0] for call in sleep.call_args_list]
         assert waits == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0]
 
+    def test_it_retries_an_error_that_is_not_a_database_error(self):
+        """The poll loop's failures are not all database errors, and a stopped worker looks
+        identical to an idle one — so anything that escapes ``run`` is retried, not fatal."""
+        calls = []
+
+        def run(self):
+            calls.append("run")
+            if len(calls) == 1:
+                raise RuntimeError("something the poll loop never expected")
+
+        wrapped = install_over(run)
+
+        with patch(f"{DB_WORKER_MODULE}.time.sleep"):
+            with patch(f"{DB_WORKER_MODULE}.close_old_connections") as reconnect:
+                wrapped(SimpleNamespace(running=True))
+
+        assert calls == ["run", "run"]
+        reconnect.assert_called_once()
+
     def test_a_shutdown_racing_the_error_is_not_retried_over(self):
         """`running` going false means somebody asked it to stop; reconnecting would ignore them."""
         worker = SimpleNamespace(running=True)

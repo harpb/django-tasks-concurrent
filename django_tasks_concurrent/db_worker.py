@@ -10,13 +10,20 @@ ends the worker, and whether anything restarts it is somebody else's problem.
 ``install_resilient_run`` wraps ``Worker.run`` so those errors force a fresh connection, back off, and
 re-enter the poll loop. It patches the class rather than subclassing it, so it applies to every way
 the worker gets built — the management command, or a ``Worker`` you drive yourself on a thread.
+
+It catches ``Exception``, not a list of database error classes, for the same reason the scheduler's
+poll loop does: the poll loop is the last thing standing between a queue and nobody draining it, and
+the ways it can die are not enumerable in advance. A per-task failure never reaches here — upstream
+``run_task`` already catches ``BaseException`` and marks the task failed — so anything that does get
+this far is the worker's own plumbing, and the useful response to all of it is the same. Retrying a
+genuine bug forever is the lesser evil: it is loud in the log every time round, where a worker that
+exited on the first surprise is silent, and looks identical to one with nothing to do.
 """
 
 import logging
 import time
 
 from django.db import close_old_connections
-from django.db.utils import InterfaceError, OperationalError
 from django_tasks_db.management.commands.db_worker import Worker
 
 logger = logging.getLogger("django_tasks_concurrent")
@@ -45,12 +52,13 @@ def install_resilient_run(max_backoff_seconds: float = RECONNECT_MAX_BACKOFF_SEC
             try:
                 original_run(self)
                 return  # Clean exit: batch complete, max-tasks reached, or shutdown.
-            except (OperationalError, InterfaceError) as database_error:
+            except Exception as worker_error:
                 if not self.running:
                     # Shutdown was requested while the error fired — let it propagate.
                     raise
                 logger.warning(
-                    f"Worker lost the database connection ({database_error=}); reconnecting in {backoff_seconds:.0f}s."
+                    f"Worker poll loop failed ({worker_error=}); reconnecting in {backoff_seconds:.0f}s.",
+                    exc_info=True,
                 )
                 close_old_connections()
                 time.sleep(backoff_seconds)
