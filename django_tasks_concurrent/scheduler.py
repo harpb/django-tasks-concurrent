@@ -20,9 +20,9 @@ import logging
 import threading
 from datetime import timedelta
 
-from asgiref.sync import sync_to_async
+from asgiref.sync import ThreadSensitiveContext, sync_to_async
 from django.conf import settings
-from django.db import IntegrityError, close_old_connections, transaction
+from django.db import IntegrityError, close_old_connections, connections, transaction
 from django.utils import timezone
 
 from django_tasks_concurrent.models import PeriodicDefer
@@ -141,18 +141,24 @@ async def defer_periodic_forever(interval: float = 15.0) -> None:
     ``interval`` is the ceiling on one sleep, not a poll period — see ``seconds_until_next_slot``.
     """
     logger.info(f"Starting scheduler interval={interval} schedules={len(registered_periodic_tasks())}")
-    while True:
+    # A separate sync thread keeps sweeps from queuing behind long-running sync tasks.
+    async with ThreadSensitiveContext():
         try:
-            fired = await sync_to_async(defer_periodic_tasks)()
-            if fired:
-                logger.debug(f"Scheduler deferred {fired} periodic task(s)")
-        except Exception as scheduler_error:
-            logger.exception(f"Scheduler poll failed: {scheduler_error}")
+            while True:
+                try:
+                    fired = await sync_to_async(defer_periodic_tasks)()
+                    if fired:
+                        logger.debug(f"Scheduler deferred {fired} periodic task(s)")
+                except Exception as scheduler_error:
+                    logger.exception(f"Scheduler poll failed: {scheduler_error}")
+                finally:
+                    # Same reasoning as the worker's sub-loop: a connection the database dropped has to be
+                    # discarded on the error path too, or every later poll reuses the dead one.
+                    await sync_to_async(close_old_connections)()
+                await asyncio.sleep(seconds_until_next_slot(max_sleep=interval))
         finally:
-            # Same reasoning as the worker's sub-loop: a connection the database dropped has to be
-            # discarded on the error path too, or every later poll reuses the dead one.
-            await sync_to_async(close_old_connections)()
-        await asyncio.sleep(seconds_until_next_slot(max_sleep=interval))
+            # The context discards its thread, so close its thread-local connections first.
+            await sync_to_async(connections.close_all)()
 
 
 def run_scheduler_thread(interval: float = 15.0) -> threading.Event:

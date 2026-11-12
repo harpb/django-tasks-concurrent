@@ -3,7 +3,8 @@ Django Tasks Concurrent - Async concurrent worker and cron scheduler for Django 
 
 Two pieces, usable together or apart:
 
-  * a management command that runs multiple async tasks concurrently using asyncio TaskGroup,
+  * a management command that runs async tasks on the event loop and sync tasks on one thread
+    per sub-worker,
     optimized for I/O-bound tasks like API calls;
   * a periodic scheduler declared in code, for the recurring work Django Tasks has no answer for
     (Django owns task definition, queuing, and results — cadence and execution are left to the
@@ -31,7 +32,7 @@ NOT own (Django's own ``db_worker``) needs the schedule started by hand, with
 ``scheduler.run_scheduler_thread()``.
 """
 
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 
 
 def __getattr__(name: str):

@@ -2,7 +2,7 @@
 
 Concurrent async worker **and cron scheduler** for [Django Tasks](https://github.com/RealOrangeOne/django-tasks).
 
-Runs multiple async tasks concurrently using `asyncio.TaskGroup`. While one task awaits I/O (API calls, database queries), others can execute. Optimized for I/O-bound workloads.
+Runs async tasks concurrently using `asyncio.TaskGroup` and sync tasks on a dedicated thread per sub-worker. With `--concurrency=3`, three sync tasks can run at once too. Optimized for I/O-bound workloads.
 
 It also adds the piece Django Tasks deliberately leaves out. Django owns task definition, queuing, and results — cadence and execution belong to the worker layer — so there is no built-in way to say "run this every five minutes". [Periodic tasks](#periodic-tasks) fills that gap with a decorator you put next to the task.
 
@@ -80,7 +80,7 @@ def cleanup_foobar(timestamp: int):
 python manage.py concurrent_worker
 ```
 
-Scheduling isn't optional because there's nothing to opt out of: the scheduler only *enqueues*, so it costs one indexed query per wake-up, and with no `@periodic` tasks declared it does nothing at all. Being off the execution path, it can't drift behind a long-running job.
+Scheduling isn't optional because there's nothing to opt out of: the scheduler only *enqueues*, so it costs one indexed query per wake-up, and with no `@periodic` tasks declared it does nothing at all. Its sync calls use a dedicated scheduler thread, so a long-running sync job cannot hold up a sweep.
 
 It runs as a **side task** beside the sub-workers, which means it shares their fate in both directions. Shutting the worker down cancels it. And if the scheduler itself dies, the worker stops rather than carrying on — a worker that has quietly stopped scheduling looks perfectly healthy from the outside while every `@periodic` task silently stops firing.
 
@@ -162,22 +162,21 @@ Requires a migration: `python manage.py migrate django_tasks_concurrent`.
 The worker spawns N sub-workers as asyncio coroutines. Each sub-worker:
 
 1. Claims a task using `SELECT FOR UPDATE SKIP LOCKED`
-2. Executes the task (async tasks run natively, sync tasks via thread pool)
+2. Executes the task (async tasks run natively, sync tasks on that sub-worker's dedicated thread)
 3. Marks task as succeeded/failed
 4. Repeats
 
-This allows true concurrent execution of async tasks - while one awaits an API response, others continue processing.
+Each sub-worker keeps claims, sync task bodies, result writes and connection cleanup on its own thread. Connections are closed before that thread is discarded at shutdown. The scheduler has its own thread as well. While one task awaits an API response or blocks in sync I/O, other sub-workers and the scheduler continue processing.
 
 ## When to Use
 
 **Use `concurrent_worker` for:**
 - I/O-bound tasks (API calls, LLM inference, HTTP requests)
-- Tasks that spend most time awaiting external services
+- Async or sync tasks that spend most time waiting for external services
 - Workloads where you want N tasks running simultaneously
 
 **Use standard `db_worker` for:**
 - CPU-bound tasks
-- Tasks that don't benefit from async
 - Simple sequential processing
 
 ## Async Task Example

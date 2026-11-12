@@ -3,16 +3,173 @@ Tests for ConcurrentWorker.
 """
 
 import asyncio
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from asgiref.sync import sync_to_async
 from django.db.utils import OperationalError
+from django_tasks.base import Task
 
+from django_tasks_concurrent.scheduler import defer_periodic_forever
 from django_tasks_concurrent.worker import ConcurrentWorker
 
 # Patched where the worker looks it up, not where it is defined.
 SCHEDULER_LOOP = "django_tasks_concurrent.worker.defer_periodic_forever"
+
+
+@pytest.fixture
+def sync_worker(monkeypatch, worker_config):
+    """Keep real Task.acall and sync bridges, replacing only database work and signals."""
+
+    def make_worker(task_body, count=2):
+        worker = ConcurrentWorker(**worker_config)
+        records = []
+        rows = []
+        pending = {}
+        completed = 0
+
+        def record(stage):
+            records.append((stage, threading.get_ident()))
+
+        def finished(stage):
+            nonlocal completed
+            record(stage)
+            completed += 1
+            if completed == count:
+                worker.running = False
+
+        # A real Task uses its real acall; backend validation is unrelated to threading.
+        monkeypatch.setattr(Task, "get_backend", lambda self: MagicMock())
+        task = Task(func=task_body)
+        for number in range(count):
+            row = MagicMock()
+            row.task = task
+            row.task_result.args = (number,)
+            row.task_result.kwargs = {}
+            row.set_successful.side_effect = lambda result: finished("successful")
+            row.set_failed.side_effect = lambda error: finished("failed")
+            rows.append(row)
+            pending[f"{worker.worker_id}-{number}"] = row
+
+        def claim(sub_id):
+            record(f"claim:{sub_id}")
+            return pending.pop(sub_id, None)
+
+        monkeypatch.setattr(worker, "_claim_task", sync_to_async(claim))
+        monkeypatch.setattr("django_tasks_concurrent.worker.close_old_connections", lambda: record("recycle"))
+        monkeypatch.setattr("django.db.connections.close_all", lambda: record("close"))
+        monkeypatch.setattr("django_tasks_concurrent.worker.task_started.send", lambda **kwargs: record("started"))
+        monkeypatch.setattr("django_tasks_concurrent.worker.task_finished.send", lambda **kwargs: record("finished"))
+        return worker, rows, records
+
+    return make_worker
+
+
+class TestSyncThreadIsolation:
+    @pytest.mark.asyncio
+    async def test_two_sync_tasks_run_concurrently(self, sync_worker):
+        """Serial task execution breaks the barrier instead of completing both tasks."""
+        barrier = threading.Barrier(2, timeout=0.5)
+
+        def task_body(number):
+            barrier.wait()
+            return number
+
+        worker, rows, records = sync_worker(task_body)
+        try:
+            await asyncio.wait_for(asyncio.gather(worker._sub_worker(0), worker._sub_worker(1)), timeout=1.5)
+        finally:
+            barrier.abort()
+            worker.running = False
+
+        for number, row in enumerate(rows):
+            row.set_failed.assert_not_called()
+            row.set_successful.assert_called_once_with(number)
+        assert len({thread_id for stage, thread_id in records if stage == "successful"}) == 2
+
+    @pytest.mark.asyncio
+    async def test_sub_workers_keep_sync_calls_on_separate_threads(self, sync_worker):
+        """Claims, task bodies, results, signals and connection cleanup share each worker's thread."""
+        body_threads = {}
+        barrier = threading.Barrier(2, timeout=0.5)
+
+        def task_body(number):
+            body_threads[number] = threading.get_ident()
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return number
+
+        worker, rows, records = sync_worker(task_body)
+        try:
+            await asyncio.wait_for(asyncio.gather(worker._sub_worker(0), worker._sub_worker(1)), timeout=2)
+        finally:
+            barrier.abort()
+            worker.running = False
+
+        assert body_threads[0] != body_threads[1]
+        for number, row in enumerate(rows):
+            row.set_successful.assert_called_once_with(number)
+        for number, thread_id in body_threads.items():
+            assert (f"claim:{worker.worker_id}-{number}", thread_id) in records
+            stages = [stage for stage, recorded_thread in records if recorded_thread == thread_id]
+            for stage in ("started", "successful", "finished", "recycle", "close"):
+                assert stage in stages
+            assert stages[-1] == "close"
+
+    @pytest.mark.asyncio
+    async def test_scheduler_sweeps_while_sync_task_is_blocked(self, sync_worker, monkeypatch):
+        """A scheduler started during a sync task must sweep before that task is released."""
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        swept = asyncio.Event()
+        release = threading.Event()
+        scheduler_records = []
+
+        def task_body(number):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=2)
+            return number
+
+        def sweep():
+            scheduler_records.append(("sweep", threading.get_ident()))
+            if not release.is_set():
+                loop.call_soon_threadsafe(swept.set)
+            return 0
+
+        worker, rows, records = sync_worker(task_body, count=1)
+        monkeypatch.setattr("django_tasks_concurrent.scheduler.defer_periodic_tasks", sweep)
+        monkeypatch.setattr("django_tasks_concurrent.scheduler.seconds_until_next_slot", lambda **kwargs: 0.01)
+        monkeypatch.setattr(
+            "django_tasks_concurrent.scheduler.close_old_connections",
+            lambda: scheduler_records.append(("recycle", threading.get_ident())),
+        )
+        sub_worker = asyncio.create_task(worker._sub_worker(0))
+        scheduler = None
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            scheduler = asyncio.create_task(defer_periodic_forever(0.01))
+            await asyncio.wait_for(swept.wait(), timeout=0.5)
+            assert not release.is_set()
+        finally:
+            release.set()
+            worker.running = False
+            if scheduler is not None:
+                scheduler.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(sub_worker, *([scheduler] if scheduler is not None else []), return_exceptions=True),
+                timeout=2,
+            )
+
+        rows[0].set_successful.assert_called_once_with(0)
+        scheduler_thread = scheduler_records[0][1]
+        worker_thread = next(thread_id for stage, thread_id in records if stage.startswith("claim:"))
+        assert scheduler_thread != worker_thread
+        assert all(thread_id == scheduler_thread for stage, thread_id in scheduler_records)
+        assert ("close", scheduler_thread) in records
 
 
 class TestConcurrentWorkerInit:

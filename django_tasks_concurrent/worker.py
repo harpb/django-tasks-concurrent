@@ -1,8 +1,8 @@
 """
 Concurrent async worker for Django Tasks.
 
-Runs multiple async tasks concurrently using asyncio TaskGroup.
-While one task awaits I/O, others can execute.
+Runs async tasks on the event loop and sync tasks on a dedicated thread per sub-worker.
+A long-running sync task cannot hold up another sub-worker or the scheduler.
 
 ``run_worker`` / ``run_worker_async`` are the entry points; the management command is a thin shell
 over the first. Both take the same options, and both schedule ``@periodic`` tasks — see
@@ -14,9 +14,9 @@ import logging
 import signal
 from typing import TypedDict, Unpack
 
-from asgiref.sync import sync_to_async
+from asgiref.sync import ThreadSensitiveContext, sync_to_async
 from django.conf import settings
-from django.db import close_old_connections
+from django.db import close_old_connections, connections
 from django.db.utils import OperationalError
 from django_tasks.base import TaskContext
 from django_tasks.signals import task_finished, task_started
@@ -34,7 +34,8 @@ class ConcurrentWorker:
     Async worker that runs multiple tasks concurrently.
 
     Uses asyncio TaskGroup to manage N sub-worker coroutines.
-    Each sub-worker claims and runs tasks independently.
+    Each sub-worker claims and runs tasks independently, with its own thread for sync calls.
+    Claims, sync task bodies, results and connection cleanup all use that same thread.
 
     Runs the @periodic scheduler too, as a side task beside the sub-workers. Not optional and not a
     flag: the scheduler only enqueues, so it costs one indexed query per wake-up, and a worker is
@@ -137,28 +138,35 @@ class ConcurrentWorker:
         sub_id = f"{self.worker_id}-{worker_num}"
         logger.debug(f"Sub-worker {sub_id} started")
 
-        while self.running:
+        # A dedicated sync thread keeps a long task from starving other workers or the scheduler.
+        async with ThreadSensitiveContext():
             try:
-                task_result = await self._claim_task(sub_id)
+                while self.running:
+                    try:
+                        task_result = await self._claim_task(sub_id)
 
-                if task_result:
-                    await self._run_task(task_result, sub_id)
-                else:
-                    # No tasks available - wait before polling again
-                    await asyncio.sleep(self.interval)
+                        if task_result:
+                            await self._run_task(task_result, sub_id)
+                        else:
+                            # No tasks available - wait before polling again
+                            await asyncio.sleep(self.interval)
 
-            except Exception as e:
-                logger.exception(f"Sub-worker {sub_id} error: {e}")
-                await asyncio.sleep(self.interval)
+                    except Exception as e:
+                        logger.exception(f"Sub-worker {sub_id} error: {e}")
+                        await asyncio.sleep(self.interval)
+                    finally:
+                        # Reset stale/broken DB connections on EVERY iteration, including the
+                        # error path. If a poll failed because the database dropped the
+                        # connection (server restart, network blip), close_old_connections()
+                        # discards the dead connection so the next poll opens a fresh one.
+                        # Placed in `finally` deliberately: if this only ran on success, a
+                        # dropped connection would be reused every iteration and the sub-worker
+                        # would keep erroring without ever recovering.
+                        await sync_to_async(close_old_connections)()
+
             finally:
-                # Reset stale/broken DB connections on EVERY iteration, including the
-                # error path. If a poll failed because the database dropped the
-                # connection (server restart, network blip), close_old_connections()
-                # discards the dead connection so the next poll opens a fresh one.
-                # Placed in `finally` deliberately: if this only ran on success, a
-                # dropped connection would be reused every iteration and the sub-worker
-                # would keep erroring without ever recovering.
-                await sync_to_async(close_old_connections)()
+                # The context discards its thread, so close its thread-local connections first.
+                await sync_to_async(connections.close_all)()
 
         logger.debug(f"Sub-worker {sub_id} stopped")
 
@@ -167,7 +175,7 @@ class ConcurrentWorker:
         """
         Claim a ready task from the queue.
 
-        Runs in thread pool to avoid blocking event loop.
+        Runs on the sub-worker's sync thread to avoid blocking the event loop.
         Uses SELECT FOR UPDATE with skip_locked for safe concurrent access.
         """
         tasks = DBTaskResult.objects.ready().filter(
@@ -190,7 +198,7 @@ class ConcurrentWorker:
 
     async def _run_task(self, db_task_result: DBTaskResult, sub_id: str) -> None:
         """
-        Execute a task - async tasks run natively, sync via thread pool.
+        Execute a task - async tasks run natively, sync on the sub-worker's dedicated thread.
         Uses task.acall() which handles both sync and async functions.
         """
         task = db_task_result.task
